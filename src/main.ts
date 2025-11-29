@@ -1,126 +1,75 @@
 import * as core from "@actions/core";
 import * as os from "os";
 import { Octokit } from "@octokit/core";
+import { createChangelog, getCommits, queryLatestRelease } from "./changelog";
+import { CommitCompare } from "./types";
+import { filterCommits } from "./MessageHelper";
 
 const GITHUB_TOKEN = core.getInput("github-token") || process.env["GITHUB_TOKEN"];
 const STABLE_REPO = core.getInput("stable-repo") || process.env["STABLE_REPO"];
 const NIGHTLY_REPO = core.getInput("nightly-repo") || process.env["NIGHTLY_REPO"];
 const LAST_COMMIT_SHA = core.getInput("last-commit-sha") || process.env["LAST_COMMIT_SHA"];
 const COMMIT_SHA = core.getInput("commit-sha") || process.env["COMMIT_SHA"];
+const NIGHTLY_TAG = core.getInput("nightly-tag") || process.env["NIGHTLY_TAG"];
 
 const HOME = os.homedir();
 
-type LatestReleaseCommitSha = {
-  repository: {
-    latestRelease: {
-      tagCommit: {
-        oid: string
-      } | null,
-      tagName: string | null
-    }
-  }
-}
-
-type Commit = {
-  sha: string,
-  commit: {
-    message: string,
-    committer: {
-      date: string
-    },
-    url: string
-  }
-}
-
-type CommitCompare = {
-  commits: Commit[]
-}
-
-async function queryLatestRelease(octokit: Octokit, owner: string, repo: string) {
-  return (await octokit.graphql<LatestReleaseCommitSha>(
-      `query GetCommitShaFromLatestRelease($owner: String!, $repo: String!) {
-          repository(owner: $owner, name: $repo) {
-              latestRelease {
-                  tagCommit {
-                      oid
-                  }
-                  
-                  tagName
-              }
-          }
-      }`, { owner: owner, repo: repo }
-  )).repository.latestRelease;
-}
-
-function shortCommitSha(sha: string) {
-  return sha.substring(0, 7);
-}
-
 async function run(): Promise<void> {
-  if (!STABLE_REPO) {
-    core.error(`Input "STABLE_REPO" not provided`);
-    return;
-  }
-
-  if (!NIGHTLY_REPO) {
-    core.error(`Input "NIGHTLY_REPO" not provided`);
-    return;
-  }
-
-  if (!COMMIT_SHA) {
-    core.error(`Input "COMMIT_SHA" not provided`);
-    return;
-  }
-
-  if (!LAST_COMMIT_SHA) {
-    core.error(`Input "LAST_COMMIT_SHA" not provided`);
-    return;
-  }
-
-  const octokit = new Octokit({ auth: GITHUB_TOKEN });
-
-  const stableSplit = STABLE_REPO.split("/");
-  const stableOwner = stableSplit[0];
-  const stableRepo = stableSplit[1];
-  core.info(`${stableOwner}/${stableRepo}`);
-
-  const latestStableRelease = await queryLatestRelease(octokit, stableOwner, stableRepo);
-  if (!latestStableRelease.tagCommit) {
-    core.error("No latest release in stable repo found!");
-    return;
-  }
-
-  const nightlySplit = NIGHTLY_REPO.split("/");
-  const nightlyOwner = nightlySplit[0];
-  const nightlyRepo = nightlySplit[1];
-
-  core.info(`${nightlyOwner}/${nightlyRepo}`);
-
-  const response = await octokit.request("GET /repos/{owner}/{repo}/compare/{basehead}", {
-    owner: stableOwner,
-    repo: stableRepo,
-    basehead: `${LAST_COMMIT_SHA}...${COMMIT_SHA}`,
-    headers: {
-      "X-GitHub-Api-Version": "2022-11-28"
+    if (!STABLE_REPO) {
+        core.error(`Input "STABLE_REPO" not provided`);
+        return;
     }
-  });
 
-  const compared = response.data as CommitCompare;
-  const commits = compared.commits.reverse();
+    if (!NIGHTLY_REPO) {
+        core.error(`Input "NIGHTLY_REPO" not provided`);
+        return;
+    }
 
-  const releaseLines = ["# Included commits", ""];
+    if (!COMMIT_SHA) {
+        core.error(`Input "COMMIT_SHA" not provided`);
+        return;
+    }
 
-  for (let commit of commits) {
-    releaseLines.push(`* [${shortCommitSha(commit.sha)}: ${commit.commit.message}](${commit.commit.url})`);
-  }
+    if (!NIGHTLY_TAG) {
+        core.error(`Input "NIGHTLY_TAG" not provided`);
+        return;
+    }
 
-  releaseLines.push("");
-  releaseLines.push(`Difference to latest stable release: [${shortCommitSha(latestStableRelease.tagName!)}...${shortCommitSha(COMMIT_SHA)}](https://github.com/${stableOwner}/${stableRepo}/compare/${latestStableRelease.tagName}...${COMMIT_SHA})`);
+    const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
-  const releaseMessage = releaseLines.join("\n");
+    const nightlySplit = NIGHTLY_REPO.split("/");
+    const nightlyOwner = nightlySplit[0];
+    const nightlyRepo = nightlySplit[1];
 
-  core.info(releaseMessage);
-  core.setOutput("releaseNote", releaseMessage);
+    const stableSplit = STABLE_REPO.split("/");
+    const stableOwner = stableSplit[0];
+    const stableRepo = stableSplit[1];
+    core.info(`Stable repo: ${stableOwner}/${stableRepo}`);
+    core.info(`Nightly repo: ${nightlyOwner}/${nightlyRepo}`);
+
+    const previousRelease = await queryLatestRelease(octokit, nightlyOwner, nightlyRepo);
+    const previousTagCommit = previousRelease?.tagCommit?.oid;
+    const previousTag = previousRelease?.tagName;
+
+    if (!previousRelease || !previousTagCommit || previousTagCommit === "0000000000000000000000000000000000000000") {
+        core.warning("No last commit found, setting init release note");
+        core.setOutput("releaseNote", "* Initial release");
+        return;
+    }
+
+    if (previousTagCommit && previousTag) {
+        const response = await getCommits(octokit, stableOwner, stableRepo, previousTag, NIGHTLY_TAG);
+        if (!response.response) {
+            core.error(`Failed to fetch commits between ${previousTag} and ${NIGHTLY_TAG}: ${response.error}!`);
+            return;
+        }
+
+        const compared = response.response.data as CommitCompare;
+        const commits = filterCommits(compared.commits.reverse());
+        const releaseMessage = createChangelog(stableOwner, stableRepo, previousTag, NIGHTLY_TAG, commits);
+        core.info(releaseMessage);
+        core.setOutput("releaseNote", releaseMessage);
+    }
 }
 
 run();
